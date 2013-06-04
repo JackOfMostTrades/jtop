@@ -1,9 +1,9 @@
 CFLAGS=-Wall -DNETLOAD_IFACE=\"br-wan\" -DIW_IFACE=\"wl0\"
-LIBS=-ldl -lpthread
+LIBS=-lpthread
 
-all: jtop.c glibtop/libgtop.a mongoose.o
+all: jtop.c glibtop/libgtop.a
 	gcc $(CFLAGS) jtop.c -c
-	gcc $(LIBS) jtop.o mongoose.o glibtop/libgtop.a -o jtop
+	gcc $(LIBS) jtop.o glibtop/libgtop.a -o jtop
 	strip jtop
 
 glibtop/libgtop.a:

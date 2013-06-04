@@ -9,16 +9,20 @@
 #include "glibtop/netload.h"
 #include "glibtop/wireless.h"
 
+#include <sys/select.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
 #include <time.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <pthread.h>
 #include <string.h>
 #include <signal.h>
+#include <stdio.h>
 
-#include "mongoose.h"
-int run_server(void);
 
 #define MAX_HISTORY 30
 struct info_data {
@@ -37,6 +41,13 @@ struct info_data {
 static struct info_data data_history[MAX_HISTORY];
 int last_index=MAX_HISTORY-1;
 pthread_mutex_t info_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+pthread_mutex_t new_info_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t new_info_cond = PTHREAD_COND_INITIALIZER;
+
+int active_thread_count=0;
+pthread_mutex_t active_thread_count_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t active_thread_returned_cond = PTHREAD_COND_INITIALIZER;
 
 static void append_sysinfo()
 {
@@ -131,68 +142,17 @@ static int data_thread_shutdown_flag = 0;
 static void* data_thread_main(void *arg) {
   while(data_thread_shutdown_flag == 0) {
     append_sysinfo();
+
+    // Wake all threads sending info to clients
+    pthread_mutex_lock(&new_info_mutex);
+    pthread_cond_broadcast(&new_info_cond);
+    pthread_mutex_unlock(&new_info_mutex);
+
     sleep(1);
   }
   return NULL;
 }
 
-static int begin_request_handler(struct mg_connection *conn) {
-  //const struct mg_request_info *request_info = mg_get_request_info(conn);
-  char content[16384];
-  int i;
-
-  pthread_mutex_lock(&info_mutex);
-
-  int first_flag = 1;
-  int content_length = 0;
-  content_length += snprintf(content + content_length, sizeof(content) - content_length,
-      "{");
-  for (i = 0; i < MAX_HISTORY; i++) {
-    int index = (last_index + MAX_HISTORY - i) % MAX_HISTORY;
-    int lindex = (last_index + MAX_HISTORY - i - 1) % MAX_HISTORY;
-    if (data_history[index].timestamp == 0 || data_history[lindex].timestamp == 0) continue;
-
-    if (!first_flag) {
-      content_length += snprintf(content + content_length, sizeof(content) - content_length, ",");
-    } else {
-      first_flag = 0;
-    }
-
-    content_length += snprintf(content + content_length, sizeof(content) - content_length,
-      "\"%lu\":{\"cpu_usage\":%f,\"mem_usage\":%f,\"swap_usage\":%f,\"net_in\":%f,\"net_out\":%f,\"tcp_conns\":%f,\"udp_conns\":%f,\"iw_signal\":%f,\"iw_noise\":%f}",
-        data_history[index].timestamp,
-        (data_history[index].cpu_used - data_history[lindex].cpu_used) / (data_history[index].cpu_total - data_history[lindex].cpu_total),
-        data_history[index].memory_usage,
-        data_history[index].swap_usage,
-        (data_history[index].network_in - data_history[lindex].network_in) / ((float)(data_history[index].timestamp - data_history[lindex].timestamp)),
-        (data_history[index].network_out - data_history[lindex].network_out) / ((float)(data_history[index].timestamp - data_history[lindex].timestamp)),
-        data_history[index].tcp_conns,
-        data_history[index].udp_conns,
-        data_history[index].iw_signal,
-        data_history[index].iw_noise
-    );
-  }
-  content_length += snprintf(content + content_length, sizeof(content) - content_length,
-      "}");
-
-  pthread_mutex_unlock(&info_mutex);
-
-  // Send HTTP reply to the client
-  mg_printf(conn,
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/plain\r\n"
-            "Content-Length: %d\r\n" // Always set Content-Length
-            "\r\n"
-            "%s",
-            content_length, content);
-
-  // Returning non-zero tells mongoose that our function has replied to
-  // the client, and mongoose should not send client any more data.
-  return 1;
-}
-
-static pthread_mutex_t shutdown_mutex = PTHREAD_MUTEX_INITIALIZER;
-static struct mg_context *ctx;
 static int shuttingdown_flag = 0;
 static pthread_mutex_t shuttingdown_flag_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -213,50 +173,140 @@ static void sig_handler(int signo) {
     }
 
     printf("Received SIGINT, shutting down...\n");
-    mg_stop(ctx);
-    pthread_mutex_unlock(&shutdown_mutex);
   }
+}
+
+void* connection_thread_main(void *arg) {
+  const int sockfd = *((int*)arg);
+  free(arg);
+  char content[16384];
+  int content_length;
+  int ret;
+ 
+  while (!shuttingdown_flag) {
+    pthread_mutex_lock(&new_info_mutex);
+    pthread_cond_wait(&new_info_cond, &new_info_mutex);
+    pthread_mutex_unlock(&new_info_mutex);
+
+    pthread_mutex_lock(&info_mutex);
+
+    int index = last_index;
+    int lindex = (last_index + MAX_HISTORY - 1) % MAX_HISTORY;
+    if (data_history[index].timestamp == 0 || data_history[lindex].timestamp == 0) {
+      pthread_mutex_unlock(&info_mutex);
+      continue;
+    }
+
+    content_length = 0;
+    content_length += snprintf(content + content_length, sizeof(content) - content_length,
+      "{\"timestamp\":%lu,\"cpu_usage\":%f,\"mem_usage\":%f,\"swap_usage\":%f,\"net_in\":%f,\"net_out\":%f,\"tcp_conns\":%f,\"udp_conns\":%f,\"iw_signal\":%f,\"iw_noise\":%f}",
+        data_history[index].timestamp,
+        (data_history[index].cpu_used - data_history[lindex].cpu_used) / (data_history[index].cpu_total - data_history[lindex].cpu_total),
+        data_history[index].memory_usage,
+        data_history[index].swap_usage,
+        (data_history[index].network_in - data_history[lindex].network_in) / ((float)(data_history[index].timestamp - data_history[lindex].timestamp)),
+        (data_history[index].network_out - data_history[lindex].network_out) / ((float)(data_history[index].timestamp - data_history[lindex].timestamp)),
+        data_history[index].tcp_conns,
+        data_history[index].udp_conns,
+        data_history[index].iw_signal,
+        data_history[index].iw_noise
+    );
+
+    pthread_mutex_unlock(&info_mutex);
+    // Write the result, including the null terminator
+    ret = write(sockfd, content, content_length+1);
+    if (ret < 0) break;
+    //ret = write(sockfd, ";", 1);
+    //if (ret < 0) break;
+  }
+
+  printf("Closing child thread.\n"); 
+  close(sockfd);
+
+  pthread_mutex_lock(&active_thread_count_mutex);
+  active_thread_count -= 1;
+  pthread_cond_broadcast(&active_thread_returned_cond);
+  pthread_mutex_unlock(&active_thread_count_mutex);
+
+  return NULL;
 }
 
 int main(int argc, char **argv) {
   int i;
+  int socketHandle;
+  struct sockaddr_in socketInfo;
   pthread_t data_thread;
-  struct mg_callbacks callbacks;
 
   if (argc != 2 || atoi(argv[1]) == 0) {
     printf("Usage: %s <port_number>\n", argv[0]);
     return -1;
   }
 
-  // List of options. Last element must be NULL.
-  const char *options[] = {"listening_ports", argv[1], "num_threads", "1", NULL};
-
   // Initialize data
   for (i = 0; i < MAX_HISTORY; i++) data_history[i].timestamp = 0;
-  append_sysinfo();
-  sleep(1);
   pthread_create( &data_thread, NULL, data_thread_main, NULL);
 
-  // Prepare callbacks structure. We have only one callback, the rest are NULL.
-  memset(&callbacks, 0, sizeof(callbacks));
-  callbacks.begin_request = begin_request_handler;
-
   // Start the web server.
-  pthread_mutex_lock(&shutdown_mutex);
-  ctx = mg_start(&callbacks, NULL, options);
-
   bsd_signal(SIGINT, sig_handler);
+  bsd_signal(SIGPIPE, SIG_IGN);
 
-  // Wait until user hits "enter". Server is running in separate thread.
-  // Navigating to http://localhost:8080 will invoke begin_request_handler().
-  printf("Waiting...\n");
-  pthread_mutex_lock(&shutdown_mutex);
-  pthread_mutex_unlock(&shutdown_mutex);
-  printf("Mutex wake-up actived.\n");
+  // Main loop
+  socketHandle = socket(AF_INET, SOCK_STREAM, 0);
+  socketInfo.sin_family = AF_INET;
+  // Use any address available to the system. This is a typical configuration for a server.
+  // Note that this is where the socket client and socket server differ.
+  // A socket client will specify the server address to connect to.
+  socketInfo.sin_addr.s_addr = htonl(INADDR_ANY); // Translate long integer to network byte order.
+  socketInfo.sin_port = htons(atoi(argv[1]));        // Set port number
+  // Bind the socket to a local socket address
+  if( bind(socketHandle, (struct sockaddr *) &socketInfo, sizeof(struct sockaddr_in)) < 0)
+  {
+     close(socketHandle);
+     perror("bind");
+     exit(EXIT_FAILURE);
+  }
+  listen(socketHandle, 1);
+
+  printf("Entering main thread...\n");
+  int socketConnection;
+  while (!shuttingdown_flag) {
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(socketHandle, &fds);
+    int ret = select(socketHandle+1, &fds, NULL, NULL, NULL);
+    if (ret >= 0 && FD_ISSET(socketHandle, &fds)) {
+      printf("Accepting a new connection.\n");
+      socketConnection = accept(socketHandle, NULL, NULL);
+
+      pthread_mutex_lock(&active_thread_count_mutex);
+      active_thread_count += 1;
+      pthread_mutex_unlock(&active_thread_count_mutex);
+
+      int* thread_data = malloc(sizeof(int));
+      *thread_data = socketConnection;
+      pthread_t child_thread;
+      pthread_create( &child_thread, NULL, connection_thread_main, thread_data);
+    }
+  }
+
+  // Close bind socket
+  close(socketHandle);
 
   data_thread_shutdown_flag = 1;
   printf("Waiting on data thread to shutdown.\n");
   pthread_join( data_thread, NULL );
+
+  printf("Waiting for active threads to return.\n");
+  pthread_mutex_lock(&active_thread_count_mutex);
+  while (active_thread_count > 0) {
+    // Make sure threads aren't just sleeping
+    pthread_mutex_lock(&new_info_mutex);
+    pthread_cond_broadcast(&new_info_cond);
+    pthread_mutex_unlock(&new_info_mutex);
+
+    pthread_cond_wait(&active_thread_returned_cond, &active_thread_count_mutex);
+  }
+  pthread_mutex_unlock(&active_thread_count_mutex);
 
   printf("Clean shutdown.\n");
 
